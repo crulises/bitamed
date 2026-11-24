@@ -1,0 +1,164 @@
+# bitamed - development environment
+#
+# Identical on Windows (WSL2) and macOS. The images below all publish
+# linux/amd64 and linux/arm64, so Apple Silicon runs natively with no
+# emulation. Do not pin `platform:` unless you hit a specific problem.
+#
+#   docker compose up -d
+#   docker compose exec app alembic -c db/alembic.ini upgrade head
+#   docker compose exec app psql postgresql://bitamed:bitamed@db:5432/bitamed -f db/seed_analytes.sql
+#   open http://localhost:8000
+#
+# Everything here is dev-only: passwords are trivial, ports are published,
+# MinIO runs unencrypted. Production overrides live in a separate file.
+#
+# Postgres starts empty on a fresh volume: nothing in this file runs schema
+# or seed SQL automatically, so a new migration never means editing this
+# file too. See db/alembic.ini and db/migrations/.
+
+name: bitamed
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bitamed
+      POSTGRES_PASSWORD: bitamed
+      POSTGRES_DB: bitamed
+      # Deterministic collation, so index behaviour matches production
+      # regardless of the developer's host locale.
+      POSTGRES_INITDB_ARGS: "--locale=C.UTF-8 --encoding=UTF8"
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bitamed -d bitamed"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    # MinIO pulled minio/minio off Docker Hub; images now live on quay.io only.
+    image: quay.io/minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: bitamed
+      MINIO_ROOT_PASSWORD: bitamed-dev-secret
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: creates buckets and locks them down. Exits when done.
+  minio-init:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 bitamed bitamed-dev-secret &&
+      mc mb --ignore-existing local/bitamed-originals &&
+      mc mb --ignore-existing local/bitamed-derived &&
+      mc anonymous set none local/bitamed-originals &&
+      mc anonymous set none local/bitamed-derived &&
+      mc version enable local/bitamed-originals &&
+      echo 'buckets ready'
+      "
+    restart: "no"
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0 --port 8000
+      --reload --reload-dir /srv/app
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/srv/app:cached          # live reload
+      - ./templates:/srv/templates:cached
+      - ./static:/srv/static:cached
+      - ./tests:/srv/tests:cached      # docker compose exec app pytest tests/
+      - ./db:/srv/db:cached            # alembic.ini, migrations/, seed_analytes.sql
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  # Ingestion worker: OpenCV preprocessing, ocrmypdf, extraction.
+  # Same image as app, different entrypoint, so OCR binaries exist in one
+  # place only. Scale with: docker compose up -d --scale worker=3
+  #
+  # Commented out: app/worker.py does not exist yet (phase 1, not started).
+  # Uncomment once it does.
+  # worker:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #     target: dev
+  #   command: ["arq", "app.worker.WorkerSettings"]
+  #   env_file: .env
+  #   volumes:
+  #     - ./app:/srv/app:cached
+  #   depends_on:
+  #     db:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #     minio:
+  #       condition: service_healthy
+
+  # Tailwind in watch mode. Not needed in production, where the CSS is built
+  # once into the image.
+  css:
+    image: node:22-alpine
+    working_dir: /srv
+    command: >
+      sh -c "npm install &&
+             npx tailwindcss -i ./static/src/app.css -o ./static/dist/app.css --watch"
+    volumes:
+      - ./:/srv
+      - node_modules:/srv/node_modules
+    profiles: ["frontend"]   # docker compose --profile frontend up
+
+  # Local mail catcher, for invitations and password resets.
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "8025:8025"   # web UI
+      - "1025:1025"   # SMTP
+    profiles: ["tools"]
+
+volumes:
+  db_data:
+  redis_data:
+  minio_data:
+  node_modules:
